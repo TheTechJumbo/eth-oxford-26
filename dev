@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NETWORK=${NETWORK:-local}
+
+RPC_LOCAL="http://127.0.0.1:8545"
+RPC_C2="https://coston2-api.flare.network/ext/C/rpc"
+EXPLORER_C2="https://coston2-explorer.flare.network"
+
+if [ -z "${PRIVATE_KEY:-}" ]; then
+  echo "Set PRIVATE_KEY in your shell before running ./dev" >&2
+  exit 1
+fi
+
+if [ -z "${REFEREE_PRIVATE_KEY:-}" ]; then
+  echo "Set REFEREE_PRIVATE_KEY in your shell before running ./dev" >&2
+  exit 1
+fi
+
+if [ -z "${REFEREE_ADDRESS:-}" ]; then
+  REFEREE_ADDRESS=$(cast wallet address --private-key "$REFEREE_PRIVATE_KEY")
+  export REFEREE_ADDRESS
+fi
+
+cleanup() {
+  if [ -n "${ANVIL_PID:-}" ]; then
+    kill "$ANVIL_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [ "$NETWORK" = "coston2" ]; then
+  echo "Network: Flare Costón2 (chainId 114)"
+fi
+
+mkdir -p "$ROOT_DIR/deployments"
+
+if [ "$NETWORK" = "local" ]; then
+  echo "Starting anvil..."
+  anvil --port 8545 >/tmp/skillstake-anvil.log 2>&1 &
+  ANVIL_PID=$!
+  sleep 1
+  RPC_URL="$RPC_LOCAL"
+  EXPLORER_URL="$RPC_LOCAL"
+  CHAIN_ID=31337
+else
+  RPC_URL="$RPC_C2"
+  EXPLORER_URL="$EXPLORER_C2"
+  CHAIN_ID=114
+fi
+
+export NETWORK RPC_URL EXPLORER_URL
+
+echo "Deploying contracts..."
+(
+  cd "$ROOT_DIR/contracts"
+  if [ "$NETWORK" = "coston2" ]; then
+    forge script script/Deploy.s.sol:Deploy --rpc-url coston2 --broadcast
+  else
+    forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC_URL" --broadcast
+  fi
+)
+
+node - <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const deploymentsPath = path.join(process.cwd(), 'deployments', 'latest.json');
+const deployments = JSON.parse(fs.readFileSync(deploymentsPath, 'utf-8'));
+
+const refereeEnv = [
+  `RPC_URL=${deployments.rpcUrl}`,
+  `CHAIN_ID=${deployments.chainId}`,
+  `REFEREE_PRIVATE_KEY=${process.env.REFEREE_PRIVATE_KEY || ''}`,
+  `CONTRACT_ADDRESS=${deployments.skillStake}`,
+  `API_KEY=${process.env.API_KEY || ''}`,
+  `DEMO_MODE=${process.env.DEMO_MODE || 'true'}`,
+  `PORT=${process.env.PORT || '4000'}`
+].join('\n') + '\n';
+
+const frontendEnv = [
+  `NEXT_PUBLIC_NETWORK=${deployments.network}`,
+  `NEXT_PUBLIC_RPC_URL=${deployments.rpcUrl}`,
+  `NEXT_PUBLIC_CHAIN_ID=${deployments.chainId}`,
+  `NEXT_PUBLIC_CONTRACT_ADDRESS=${deployments.skillStake}`,
+  `NEXT_PUBLIC_EXPLORER_BASE=${deployments.explorer}`,
+  `NEXT_PUBLIC_REFEREE_URL=${process.env.NEXT_PUBLIC_REFEREE_URL || 'http://localhost:4000'}`,
+  `NEXT_PUBLIC_NATIVE_SYMBOL=${deployments.chainId === 114 ? 'C2FLR' : 'ETH'}`
+].join('\n') + '\n';
+
+fs.writeFileSync(path.join(process.cwd(), 'referee', '.env'), refereeEnv);
+fs.writeFileSync(path.join(process.cwd(), 'frontend', '.env.local'), frontendEnv);
+NODE
+
+echo "Seeding demo wallets..."
+NETWORK="$NETWORK" RPC_URL="$RPC_URL" "$ROOT_DIR/scripts/seed.sh"
+
+echo "Starting referee service..."
+(
+  cd "$ROOT_DIR/referee"
+  npm run dev
+) &
+REF_PID=$!
+
+echo "Starting frontend..."
+(
+  cd "$ROOT_DIR/frontend"
+  npm run dev
+) &
+FE_PID=$!
+
+wait "$REF_PID" "$FE_PID"
